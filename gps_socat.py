@@ -216,7 +216,7 @@ class GpsServiceManager:
         if satellite_count is not None and satellite_count > 0:
             # We have good data (non-zero satellites); reset the timer
             self.last_good_data_time = time.time()
-            logger.info(f"GPS Fix Active. Satellites: {satellite_count}. Monitoring continues.")
+            logger.debug(f"GPS Fix Active. Satellites: {satellite_count}. Monitoring continues.")
         else:
             # Data is invalid (0 satellites or dbus read failed)
             time_since_last_fix = time.time() - self.last_good_data_time

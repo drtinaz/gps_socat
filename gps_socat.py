@@ -38,7 +38,7 @@ def load_config():
             'max_idle_time_seconds': config.getint('MONITORING', 'max_idle_time_seconds'),
             'watchdog_check_interval': config.getint('MONITORING', 'watchdog_check_interval'),
             'dbus_service': config['MONITORING']['dbus_service'],
-            'dbus_path_last_update': config['MONITORING']['dbus_path_last_update'],
+            'dbus_path_last_update': config['MONITORING']['dbus_path_last_update'], # Now /NumberOfSatellites
         }
         return cfg
     except KeyError as e:
@@ -67,6 +67,7 @@ class GpsServiceManager:
         self.config = load_config()
         self.socat_process = None
         self.gps_dbus_process = None
+        self.last_good_data_time = time.time() # NEW: Track the last time satellites were seen
 
         logger.info("--- Initializing GPS Service Manager ---")
         
@@ -149,13 +150,12 @@ class GpsServiceManager:
         self.gps_dbus_process = None
         logger.info("All services stopped.")
 
-# ... other GpsServiceManager methods above ...
-    
-    def _get_dbus_timestamp(self):
+# ... other GpsServiceManager methods ...
+
+    def _get_dbus_satellite_count(self):
         """
-        Reads the DBus path (now /GpsTime) and returns the difference
-        between the current time and the last GPS update time in seconds.
-        Returns None on failure.
+        Reads the /NumberOfSatellites path.
+        Returns the integer count, or None on failure/missing data.
         """
         try:
             dbus_cmd = [
@@ -164,7 +164,7 @@ class GpsServiceManager:
                 '--print-reply', 
                 '--type=method_call', 
                 f"--dest={self.config['dbus_service']}", 
-                self.config['dbus_path_last_update'], # This is now /GpsTime
+                self.config['dbus_path_last_update'], # This is now /NumberOfSatellites
                 'org.freedesktop.DBus.Properties.Get', 
                 'string:com.victronenergy.BusItem', 
                 'string:Value'
@@ -173,31 +173,21 @@ class GpsServiceManager:
             proc = subprocess.Popen(dbus_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             stdout, stderr = proc.communicate(timeout=5)
             
-            # The output for /GpsTime is typically 'variant       double 1709244000.0'
-            if 'double' in stdout:
+            # The output for /NumberOfSatellites is typically 'variant       int32 9'
+            if 'int32' in stdout:
                 parts = stdout.split()
-                value_str = parts[parts.index('double') + 1]
-                gps_timestamp = float(value_str)
-                
-                # Check for a zero/invalid timestamp, which happens if no fix is found
-                if gps_timestamp == 0.0:
-                    return None 
-                
-                # Calculate the difference (age)
-                time_difference = time.time() - gps_timestamp
-                
-                # If the difference is negative (clock sync issue, should not happen often)
-                # treat it as zero age.
-                return max(0, time_difference) 
+                # Find the index of 'int32' and the value is the next part
+                value_str = parts[parts.index('int32') + 1]
+                return int(value_str)
                 
         except Exception as e:
-            logger.debug(f"Could not read DBus timestamp: {e}")
+            logger.debug(f"Could not read DBus path {self.config['dbus_path_last_update']}: {e}")
             return None
             
         return None
 
     def _watchdog_monitor(self):
-        """GLib Timeout handler: Checks process status and calculated data freshness."""
+        """GLib Timeout handler: Checks process status and data presence."""
         
         # 1. Check if processes are running (No change here)
         if self.socat_process is None or self.socat_process.poll() is not None:
@@ -212,41 +202,26 @@ class GpsServiceManager:
             self._start_services()
             return True
 
-        # 2. Check DBus for data activity (Idle check)
-        time_since_last_update = self._get_dbus_timestamp()
+        # 2. Check DBus for data activity (Fix/Satellite check)
+        satellite_count = self._get_dbus_satellite_count()
         max_idle = self.config['max_idle_time_seconds']
-        
-        if time_since_last_update is not None:
-            # We now have the actual age in seconds
-            logger.info(f"Time since last GPS fix: {time_since_last_update:.2f} seconds.")
-            
-            if time_since_last_update > max_idle:
-                logger.error(f"GPS data is stale! Idle for {time_since_last_update:.2f}s (Max: {max_idle}s). Initiating restart.")
-                self._stop_services()
-                self._start_services()
-        else:
-            # This handles cases where:
-            # a) The dbus-send command failed entirely, or 
-            # b) The /GpsTime value was 0.0 (meaning no fix/invalid data)
-            logger.warning("Could not read /GpsTime or the time was zero (No Fix). May be a transient issue.")
-            
-        return True
 
-        # 2. Check DBus for data activity (Idle check)
-        time_since_last_update = self._get_dbus_timestamp()
-        max_idle = self.config['max_idle_time_seconds']
-        
-        if time_since_last_update is not None:
-            logger.info(f"Time since last GPS fix: {time_since_last_update:.2f} seconds.")
+        if satellite_count is not None and satellite_count > 0:
+            # We have good data (non-zero satellites); reset the timer
+            self.last_good_data_time = time.time()
+            logger.info(f"GPS Fix Active. Satellites: {satellite_count}. Monitoring continues.")
+        else:
+            # Data is invalid (0 satellites or dbus read failed)
+            time_since_last_fix = time.time() - self.last_good_data_time
             
-            if time_since_last_update > max_idle:
-                logger.error(f"GPS data is stale! Idle for {time_since_last_update:.2f}s (Max: {max_idle}s). Initiating restart.")
+            logger.warning(f"No valid satellite count ({satellite_count}). Time since last good fix: {time_since_last_last_fix:.0f}s.")
+            
+            if time_since_last_fix > max_idle:
+                logger.error(f"GPS data missing/invalid for over {max_idle}s. Initiating full service restart.")
                 self._stop_services()
                 self._start_services()
-        else:
-            logger.warning("Could not read /TimeSinceLastUpdate from DBus. May be a transient issue.")
             
-        return True 
+        return True # Continue monitoring 
 
 def signal_handler(sig, frame):
     """Gracefully handles termination signals (TERM, INT)."""

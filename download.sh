@@ -1,7 +1,7 @@
 #!/bin/bash
 
 driver_path="/data/apps"
-driver_name="external_devices"
+driver_name="gps_socat"
 
 # check if /data/apps path exists
 if [ ! -d "/data/apps" ]; then
@@ -168,33 +168,32 @@ chmod 755 ${driver_path}/${driver_name}/restart.sh
 chmod 755 ${driver_path}/${driver_name}/uninstall.sh
 chmod 755 ${driver_path}/${driver_name}/service/run
 chmod 755 ${driver_path}/${driver_name}/service/log/run
-chmod 755 ${driver_path}/${driver_name}/config.py
+# chmod 755 ${driver_path}/${driver_name}/config.py
 
 
 # copy default config file
 if [ ! -f ${driver_path}/${driver_name}/config.ini ]; then
     echo ""
     echo ""
-    echo "First installation detected. Before completing the install"
-    echo "you must run the configuration script with the following command:"
-    echo "python ${driver_path}/${driver_name}/config.py"
+#    echo "First installation detected. Before completing the install"
+#    echo "you must run the configuration script with the following command:"
+#    echo "python ${driver_path}/${driver_name}/config.py"
+#    echo ""
+    echo "** Do not forget to edit the config file with your settings! **"
+    echo "You can edit the config file with the following command:"
+    echo "nano ${driver_path}/${driver_name}/config.ini"
+    cp ${driver_path}/${driver_name}/config.sample.ini ${driver_path}/${driver_name}/config.ini
     echo ""
-#    echo "** Do not forget to edit the config file with your settings! **"
-#    echo "You can edit the config file with the following command:"
-#    echo "nano ${driver_path}/${driver_name}/config.ini"
-#    cp ${driver_path}/${driver_name}/config.sample.ini ${driver_path}/${driver_name}/config.ini
-    echo ""
-    echo "** Execute the install.sh script after you have ran the config.py! **"
+    echo "** Execute the install.sh script after you have edited the config.ini! **"
     echo "You can execute the install.sh script with the following command:"
     echo "bash ${driver_path}/${driver_name}/install.sh"
-    echo "or execute the restart.sh script if this is an update to an existing version:"
-    echo "bash ${driver_path}/${driver_name}/restart.sh"
+#    echo "or execute the restart.sh script if this is an update to an existing version:"
+#    echo "bash ${driver_path}/${driver_name}/restart.sh"
     echo ""
  else
-    echo ""
-    echo "Rebooting to apply new version..."
+    echo "Restarting driver to apply new version..."
     sleep 5
-    reboot
+    /bin/bash ${driver_path}/${driver_name}/restart.sh
 fi
 
 

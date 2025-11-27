@@ -6,27 +6,44 @@ import os
 import signal
 import sys
 import logging
+import configparser
 from dbus.mainloop.glib import DBusGMainLoop
 from gi.repository import GLib
 
-# --- Configuration ---
-ROUTER_IP = "192.168.8.1"
-ROUTER_PORT = "5555"
-TTY_DEVICE = "/dev/ttyGPS0"
-BAUD_RATE = "115200"
-GPS_DBUS_PATH = "/opt/victronenergy/gps-dbus/gps_dbus"
-SOCAT_PATH = "/usr/bin/socat"
+# --- Configuration File Path ---
+CONFIG_FILE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.ini')
 
-# Monitoring thresholds
-MAX_IDLE_TIME_SECONDS = 120  # Max time allowed without a new GPS fix (2 minutes)
-WATCHDOG_CHECK_INTERVAL = 30 # How often to check the DBus timestamp/process status
-
-# DBus configuration for monitoring
-DBUS_SERVICE = 'com.victronenergy.gps'
-DBUS_PATH_LAST_UPDATE = '/TimeSinceLastUpdate'
-
-# --- Global Process and Logger Variables ---
+# --- Global Logger Variable ---
 logger = None
+
+def load_config():
+    """Loads all configuration settings from the config.ini file."""
+    config = configparser.ConfigParser()
+    if not os.path.exists(CONFIG_FILE_PATH):
+        print(f"ERROR: Configuration file not found at {CONFIG_FILE_PATH}", file=sys.stderr)
+        sys.exit(1)
+        
+    config.read(CONFIG_FILE_PATH)
+    
+    try:
+        cfg = {
+            'router_ip': config['CONNECTION']['router_ip'],
+            'router_port': config.getint('CONNECTION', 'router_port'),
+            'tty_device': config['CONNECTION']['tty_device'],
+            'baud_rate': config['CONNECTION']['baud_rate'],
+            
+            'gps_dbus_path': config['PATHS']['gps_dbus_path'],
+            'socat_path': config['PATHS']['socat_path'],
+            
+            'max_idle_time_seconds': config.getint('MONITORING', 'max_idle_time_seconds'),
+            'watchdog_check_interval': config.getint('MONITORING', 'watchdog_check_interval'),
+            'dbus_service': config['MONITORING']['dbus_service'],
+            'dbus_path_last_update': config['MONITORING']['dbus_path_last_update'],
+        }
+        return cfg
+    except KeyError as e:
+        print(f"ERROR: Missing configuration key in config.ini: {e}", file=sys.stderr)
+        sys.exit(1)
 
 def setup_logging():
     """Sets up standard output logging for multilog capture."""
@@ -34,13 +51,10 @@ def setup_logging():
     logger = logging.getLogger('GpsService')
     logger.setLevel(logging.INFO)
     
-    # Remove any existing handlers to prevent duplicate logs on service restart
     if logger.hasHandlers():
         logger.handlers.clear()
     
-    # Stream Handler: Directs all logs to sys.stdout for multilog to capture
     stream_handler = logging.StreamHandler(sys.stdout)
-    # Define the desired log format
     formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
     stream_handler.setFormatter(formatter)
     logger.addHandler(stream_handler)
@@ -50,24 +64,23 @@ def setup_logging():
 
 class GpsServiceManager:
     def __init__(self):
+        self.config = load_config()
         self.socat_process = None
         self.gps_dbus_process = None
 
         logger.info("--- Initializing GPS Service Manager ---")
         
         if not self._install_socat():
-            # If socat fails to install, exit with error so runit retries
             sys.exit(1)
 
         self._start_services()
 
-        # Start the GLib Watchdog (the main monitoring loop)
-        GLib.timeout_add_seconds(WATCHDOG_CHECK_INTERVAL, self._watchdog_monitor)
+        GLib.timeout_add_seconds(self.config['watchdog_check_interval'], self._watchdog_monitor)
         
     def _install_socat(self):
         """Checks for and installs socat using opkg if necessary."""
         logger.info("Checking for socat installation...")
-        if not os.path.exists(SOCAT_PATH):
+        if not os.path.exists(self.config['socat_path']):
             logger.warning("socat not found. Attempting installation via opkg...")
             try:
                 subprocess.run(["opkg", "update"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -85,13 +98,13 @@ class GpsServiceManager:
 
     def _start_services(self):
         """Starts the socat and gps_dbus processes."""
-        self._stop_services() # Clean state
+        self._stop_services() 
 
         # 1. Start socat
         socat_cmd = [
-            SOCAT_PATH,
-            f"TCP:{ROUTER_IP}:{ROUTER_PORT}",
-            f"pty,link={TTY_DEVICE},raw,nonblock,echo=0,b{BAUD_RATE}"
+            self.config['socat_path'],
+            f"TCP:{self.config['router_ip']}:{self.config['router_port']}",
+            f"pty,link={self.config['tty_device']},raw,nonblock,echo=0,b{self.config['baud_rate']}"
         ]
         logger.info(f"Starting socat: {' '.join(socat_cmd)}")
         try:
@@ -100,13 +113,13 @@ class GpsServiceManager:
             logger.error(f"Failed to launch socat: {e}")
             return False
 
-        time.sleep(2) # Give time for TTY link to be created
+        time.sleep(2) 
 
         # 2. Start gps_dbus
         gps_dbus_cmd = [
-            GPS_DBUS_PATH,
-            "-s", TTY_DEVICE,
-            "-b", BAUD_RATE,
+            self.config['gps_dbus_path'],
+            "-s", self.config['tty_device'],
+            "-b", self.config['baud_rate'],
             "-t", "0"
         ]
         logger.info(f"Starting gps_dbus: {' '.join(gps_dbus_cmd)}")
@@ -122,7 +135,6 @@ class GpsServiceManager:
 
     def _stop_services(self):
         """Stops the socat and gps_dbus processes."""
-        
         for proc in [self.gps_dbus_process, self.socat_process]:
             if proc and proc.poll() is None:
                 logger.info(f"Stopping process (PID: {proc.pid})")
@@ -145,8 +157,8 @@ class GpsServiceManager:
                 '--system', 
                 '--print-reply', 
                 '--type=method_call', 
-                '--dest=com.victronenergy.gps', 
-                DBUS_PATH_LAST_UPDATE, 
+                f"--dest={self.config['dbus_service']}", 
+                self.config['dbus_path_last_update'], 
                 'org.freedesktop.DBus.Properties.Get', 
                 'string:com.victronenergy.BusItem', 
                 'string:Value'
@@ -184,18 +196,19 @@ class GpsServiceManager:
 
         # 2. Check DBus for data activity (Idle check)
         time_since_last_update = self._get_dbus_timestamp()
+        max_idle = self.config['max_idle_time_seconds']
         
         if time_since_last_update is not None:
             logger.info(f"Time since last GPS fix: {time_since_last_update:.2f} seconds.")
             
-            if time_since_last_update > MAX_IDLE_TIME_SECONDS:
-                logger.error(f"GPS data is stale! Idle for {time_since_last_update:.2f}s. Initiating restart.")
+            if time_since_last_update > max_idle:
+                logger.error(f"GPS data is stale! Idle for {time_since_last_update:.2f}s (Max: {max_idle}s). Initiating restart.")
                 self._stop_services()
                 self._start_services()
         else:
             logger.warning("Could not read /TimeSinceLastUpdate from DBus. May be a transient issue.")
             
-        return True # Continue monitoring
+        return True 
 
 def signal_handler(sig, frame):
     """Gracefully handles termination signals (TERM, INT)."""
@@ -219,6 +232,5 @@ if __name__ == "__main__":
     except Exception as e:
         logger.error(f"Main loop encountered an error: {e}. Exiting.")
         
-    # Ensure external processes are stopped upon MainLoop exit
     manager._stop_services()
     logger.info("Service process finished.")

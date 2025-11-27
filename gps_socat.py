@@ -31,14 +31,13 @@ def load_config():
             'router_port': config.getint('CONNECTION', 'router_port'),
             'tty_device': config['CONNECTION']['tty_device'],
             'baud_rate': config['CONNECTION']['baud_rate'],
-            
             'gps_dbus_path': config['PATHS']['gps_dbus_path'],
             'socat_path': config['PATHS']['socat_path'],
-            
             'max_idle_time_seconds': config.getint('MONITORING', 'max_idle_time_seconds'),
             'watchdog_check_interval': config.getint('MONITORING', 'watchdog_check_interval'),
             'dbus_service': config['MONITORING']['dbus_service'],
-            'dbus_path_last_update': config['MONITORING']['dbus_path_last_update'], # Now /NumberOfSatellites
+            'dbus_object_path': config['MONITORING']['dbus_object_path'], # NEW KEY
+            'dbus_property_name': config['MONITORING']['dbus_property_name'], # NEW KEY
         }
         return cfg
     except KeyError as e:
@@ -154,7 +153,7 @@ class GpsServiceManager:
 
     def _get_dbus_satellite_count(self):
         """
-        Reads the /NumberOfSatellites path.
+        Reads the /ve_ttyGPS0/NrOfSatellites path using the correct DBus command syntax.
         Returns the integer count, or None on failure/missing data.
         """
         try:
@@ -164,16 +163,15 @@ class GpsServiceManager:
                 '--print-reply', 
                 '--type=method_call', 
                 f"--dest={self.config['dbus_service']}", 
-                self.config['dbus_path_last_update'], # This is now /NumberOfSatellites
+                self.config['dbus_object_path'], # Use the Object Path (/ve_ttyGPS0)
                 'org.freedesktop.DBus.Properties.Get', 
                 'string:com.victronenergy.BusItem', 
-                'string:Value'
+                f"string:{self.config['dbus_property_name']}" # Use the Property Name (NrOfSatellites)
             ]
             
             proc = subprocess.Popen(dbus_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             stdout, stderr = proc.communicate(timeout=5)
             
-            # The output for /NumberOfSatellites is typically 'variant       int32 9'
             if 'int32' in stdout:
                 parts = stdout.split()
                 # Find the index of 'int32' and the value is the next part
@@ -181,7 +179,9 @@ class GpsServiceManager:
                 return int(value_str)
                 
         except Exception as e:
-            logger.debug(f"Could not read DBus path {self.config['dbus_path_last_update']}: {e}")
+            # Note: The logger here needs to be careful not to trigger a debug message if the satellite count is 0
+            # However, since this returns None, the watchdog handles the warning/restart logic.
+            logger.debug(f"Could not read DBus property {self.config['dbus_property_name']}: {e}")
             return None
             
         return None
@@ -214,14 +214,14 @@ class GpsServiceManager:
             # Data is invalid (0 satellites or dbus read failed)
             time_since_last_fix = time.time() - self.last_good_data_time
             
-            logger.warning(f"No valid satellite count ({satellite_count}). Time since last good fix: {time_since_last_fix:.0f}s.")
+            logger.warning(f"No valid satellite count ({satellite_count}). Time since last good fix: {time_since_last_fix:.0f}s.") # Cleaned up variable name for clarity
             
             if time_since_last_fix > max_idle:
                 logger.error(f"GPS data missing/invalid for over {max_idle}s. Initiating full service restart.")
                 self._stop_services()
                 self._start_services()
             
-        return True # Continue monitoring 
+        return True 
 
 def signal_handler(sig, frame):
     """Gracefully handles termination signals (TERM, INT)."""

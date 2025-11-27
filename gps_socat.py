@@ -98,7 +98,7 @@ class GpsServiceManager:
 
     def _start_services(self):
         """Starts the socat and gps_dbus processes."""
-        self._stop_services() 
+        self._stop_services() # Clean state
 
         # 1. Start socat
         socat_cmd = [
@@ -113,7 +113,7 @@ class GpsServiceManager:
             logger.error(f"Failed to launch socat: {e}")
             return False
 
-        time.sleep(2) 
+        time.sleep(2) # Give time for TTY link to be created
 
         # 2. Start gps_dbus
         gps_dbus_cmd = [
@@ -131,6 +131,13 @@ class GpsServiceManager:
             return False
             
         logger.info(f"Services started. socat PID: {self.socat_process.pid}, gps_dbus PID: {self.gps_dbus_process.pid}")
+        
+        # *** FIX: Reset the monitoring clock after a successful service start ***
+        current_time = time.time()
+        self.last_good_data_time = current_time 
+        self.startup_time = current_time
+        logger.info("Watchdog timer reset due to successful service start.")
+
         return True
 
     def _stop_services(self):
@@ -153,7 +160,7 @@ class GpsServiceManager:
 
     def _get_dbus_satellite_count(self):
         """
-        Reads the /ve_ttyGPS0/NrOfSatellites path using the correct DBus command syntax.
+        Reads the /NrOfSatellites/Value property.
         Returns the integer count, or None on failure/missing data.
         """
         try:
@@ -163,24 +170,24 @@ class GpsServiceManager:
                 '--print-reply', 
                 '--type=method_call', 
                 f"--dest={self.config['dbus_service']}", 
-                self.config['dbus_object_path'], # Use the Object Path (/ve_ttyGPS0)
+                self.config['dbus_object_path'],
                 'org.freedesktop.DBus.Properties.Get', 
                 'string:com.victronenergy.BusItem', 
-                f"string:{self.config['dbus_property_name']}" # Use the Property Name (NrOfSatellites)
+                f"string:{self.config['dbus_property_name']}"
             ]
             
             proc = subprocess.Popen(dbus_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             stdout, stderr = proc.communicate(timeout=5)
             
-            if 'int32' in stdout:
+            # --- FINAL FIX: LOOK FOR 'byte' INSTEAD OF 'int32' ---
+            if 'byte' in stdout:
                 parts = stdout.split()
-                # Find the index of 'int32' and the value is the next part
-                value_str = parts[parts.index('int32') + 1]
+                # Find the index of 'byte' and the value is the next part
+                value_str = parts[parts.index('byte') + 1]
                 return int(value_str)
+            # ---------------------------------------------------
                 
         except Exception as e:
-            # Note: The logger here needs to be careful not to trigger a debug message if the satellite count is 0
-            # However, since this returns None, the watchdog handles the warning/restart logic.
             logger.debug(f"Could not read DBus property {self.config['dbus_property_name']}: {e}")
             return None
             

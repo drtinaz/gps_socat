@@ -149,8 +149,14 @@ class GpsServiceManager:
         self.gps_dbus_process = None
         logger.info("All services stopped.")
 
+# ... other GpsServiceManager methods above ...
+    
     def _get_dbus_timestamp(self):
-        """Reads the /TimeSinceLastUpdate path via dbus-send."""
+        """
+        Reads the DBus path (now /GpsTime) and returns the difference
+        between the current time and the last GPS update time in seconds.
+        Returns None on failure.
+        """
         try:
             dbus_cmd = [
                 'dbus-send', 
@@ -158,7 +164,7 @@ class GpsServiceManager:
                 '--print-reply', 
                 '--type=method_call', 
                 f"--dest={self.config['dbus_service']}", 
-                self.config['dbus_path_last_update'], 
+                self.config['dbus_path_last_update'], # This is now /GpsTime
                 'org.freedesktop.DBus.Properties.Get', 
                 'string:com.victronenergy.BusItem', 
                 'string:Value'
@@ -167,10 +173,22 @@ class GpsServiceManager:
             proc = subprocess.Popen(dbus_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             stdout, stderr = proc.communicate(timeout=5)
             
+            # The output for /GpsTime is typically 'variant       double 1709244000.0'
             if 'double' in stdout:
                 parts = stdout.split()
                 value_str = parts[parts.index('double') + 1]
-                return float(value_str)
+                gps_timestamp = float(value_str)
+                
+                # Check for a zero/invalid timestamp, which happens if no fix is found
+                if gps_timestamp == 0.0:
+                    return None 
+                
+                # Calculate the difference (age)
+                time_difference = time.time() - gps_timestamp
+                
+                # If the difference is negative (clock sync issue, should not happen often)
+                # treat it as zero age.
+                return max(0, time_difference) 
                 
         except Exception as e:
             logger.debug(f"Could not read DBus timestamp: {e}")
@@ -179,9 +197,9 @@ class GpsServiceManager:
         return None
 
     def _watchdog_monitor(self):
-        """GLib Timeout handler: Checks process status and data freshness."""
+        """GLib Timeout handler: Checks process status and calculated data freshness."""
         
-        # 1. Check if processes are running
+        # 1. Check if processes are running (No change here)
         if self.socat_process is None or self.socat_process.poll() is not None:
             logger.error("socat process died unexpectedly! Initiating restart.")
             self._stop_services()
@@ -193,6 +211,26 @@ class GpsServiceManager:
             self._stop_services()
             self._start_services()
             return True
+
+        # 2. Check DBus for data activity (Idle check)
+        time_since_last_update = self._get_dbus_timestamp()
+        max_idle = self.config['max_idle_time_seconds']
+        
+        if time_since_last_update is not None:
+            # We now have the actual age in seconds
+            logger.info(f"Time since last GPS fix: {time_since_last_update:.2f} seconds.")
+            
+            if time_since_last_update > max_idle:
+                logger.error(f"GPS data is stale! Idle for {time_since_last_update:.2f}s (Max: {max_idle}s). Initiating restart.")
+                self._stop_services()
+                self._start_services()
+        else:
+            # This handles cases where:
+            # a) The dbus-send command failed entirely, or 
+            # b) The /GpsTime value was 0.0 (meaning no fix/invalid data)
+            logger.warning("Could not read /GpsTime or the time was zero (No Fix). May be a transient issue.")
+            
+        return True
 
         # 2. Check DBus for data activity (Idle check)
         time_since_last_update = self._get_dbus_timestamp()

@@ -214,7 +214,7 @@ class GpsServiceManager:
             # Data is invalid (0 satellites or dbus read failed)
             time_since_last_fix = time.time() - self.last_good_data_time
             
-            logger.warning(f"No valid satellite count ({satellite_count}). Time since last good fix: {time_since_last_last_fix:.0f}s.")
+            logger.warning(f"No valid satellite count ({satellite_count}). Time since last good fix: {time_since_last_fix:.0f}s.")
             
             if time_since_last_fix > max_idle:
                 logger.error(f"GPS data missing/invalid for over {max_idle}s. Initiating full service restart.")

@@ -1,7 +1,7 @@
 #!/bin/bash
 # Runit service execution file for the GPS monitor.
 
-# Path to your python script
+# Path to your python script (relative to the app directory)
 SERVICE_SCRIPT="/data/apps/gps_socat/gps_socat.py"
 
 # Execute the script. 

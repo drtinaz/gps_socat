@@ -2,61 +2,52 @@
 # --- Configuration ---
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 SERVICE_NAME=$(basename $SCRIPT_DIR)
-SERVICE_PATH="/service/$SERVICE_NAME"
-# Time in seconds to wait for graceful shutdown/check
-GRACE_PERIOD=3 
 
 echo
-echo "Initiating **Fail-Safe Restart** for $SERVICE_NAME..."
+echo "Initiating **Simple Force-Restart** for $SERVICE_NAME..."
+echo "---"
 
-## 1. STOP SERVICE & CLEAN UP (Your Robust Logic)
-echo "--- Service Shutdown and Cleanup ---"
+## 1. RESET LOGGING STREAM (Safely using SIGALRM)
+echo "Resetting log stream to capture new startup..."
 
-# Attempt graceful shutdown (optional, but good practice)
-svc -d $SERVICE_PATH
-echo "Sent shutdown command. Waiting ${GRACE_PERIOD} seconds..."
-sleep $GRACE_PERIOD
-
-# Check for remaining processes (PIDS) and force kill
-PIDS=$(fuser $SERVICE_PATH 2>/dev/null)
-
-if [ -n "$PIDS" ]; then
-    echo "⚠️ **Warning:** PIDs ($PIDS) still exist. Forcing kill..."
-    # The kill command is the action that triggers the supervisor to restart the service
-    kill -9 $PIDS 2>/dev/null
-    sleep 1 # Wait for kill -9 to take effect and for supervisor to detect the death
-    
-    PIDS_AFTER_KILL=$(fuser $SERVICE_PATH 2>/dev/null)
-    if [ -n "$PIDS_AFTER_KILL" ]; then
-        echo "❌ **Error:** Failed to kill PIDs ($PIDS_AFTER_KILL). Aborting."
-        exit 1
-    fi
-    echo "Service cleanup complete."
-else
-    # Since it shut down cleanly, explicitly tell supervisor to start it
-    svc -u $SERVICE_PATH
-    echo "Graceful shutdown, starting service..."
-fi
-
-## 2. RESET LOGGING STREAM
-echo "--- Log Rotation ---"
-# Find the PID of the multilog process for this service
-MULTILOG_PID=$(ps | grep 'multilog.*'"$SERVICE_NAME" | grep -v grep | awk '{print $1}')
+# Find the PID of the multilog process for the service
+# We need to find this BEFORE we kill it in the next step.
+MULTILOG_PID=$(ps | grep 'multilog.*'"$SERVICE_NAME" | grep -v 'grep' | awk '{print $1}')
 
 if [ -n "$MULTILOG_PID" ]; then
-    echo "Found multilog PID ($MULTILOG_PID). Sending SIGALRM to force rotation..."
+    # Sending SIGALRM to the current logger ensures the log file is rotated/cleared correctly.
     kill -ALRM $MULTILOG_PID
-    echo "Log rotation signal sent."
+    echo "Log reset signal sent to PID ($MULTILOG_PID)."
 else
-    echo "❌ **Warning:** Could not find multilog process. Log rotation skipped."
+    echo "❌ **Warning:** Could not find multilog process. Log file will not be cleared."
 fi
+echo "---"
 
-## 3. FINAL STAGE: SERVICE RESTARTED AUTOMATICALLY
-echo "--- Service Startup ---"
-# The service was either restarted by svc -u above, or automatically by 'supervise' 
-# when the PIDs were killed. Wait a moment to allow the new service to stabilize.
-echo "Waiting for supervise to complete automatic restart..."
+## 2. KILL ALL SERVICE-RELATED PROCESSES
+echo "Killing all components (App, Supervisor, Logger) to force system restart..."
+
+# Look for PIDs whose command line contains the service name
+# Exclude the script itself and grep process
+PIDS_TO_KILL=$(ps | grep "$SERVICE_NAME" | grep -v 'grep' | grep -v "$0" | awk '{print $1}')
+
+if [ -z "$PIDS_TO_KILL" ]; then
+    echo "No running PIDs found."
+else
+    echo "Found PIDs: ($PIDS_TO_KILL). Sending **kill -9** to all..."
+    
+    # KILL COMMAND (This is the action that triggers the system's immediate restart)
+    kill -9 $PIDS_TO_KILL 2>/dev/null
+    
+    # Pause briefly for the OS to finalize the kill and for svscan to react.
+    sleep 1
+    
+    echo "All old components terminated."
+fi
+echo "---"
+
+## 3. SYSTEM RESTARTS AUTOMATICALLY
+echo "Service is being restarted automatically by the system scanner (svscan)."
+echo "Waiting 2 seconds for new service to stabilize..."
 sleep 2
 
-echo "**Restart complete.**"
-echo
+echo "**Restart complete.** Check the log for the new startup messages."

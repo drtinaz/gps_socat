@@ -20,3 +20,5 @@ v1.0.2
   update restart script
 v1.0.4
   add clarification for tty settings in config.ini
+v1.0.5.1beta
+  update restart script and uninstall script to also handle child processes

@@ -33,7 +33,7 @@ pkill -f "multilog .*$SERVICE_NAME"
 pkill -f "python .*$SERVICE_NAME"
 # Explicitly kill the child processes: socat and gps_dbus
 pkill -f "socat .*pty,link=.*"
-pkill -f "gps_dbus"
+pkill -f "gps-dbus"
 
 
 echo "done."

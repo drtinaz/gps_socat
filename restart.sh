@@ -31,7 +31,7 @@ echo "Killing all components (App, Supervisor, Logger) to force system restart..
 PIDS_TO_KILL=$(
     ps | grep "$SERVICE_NAME" | grep -v 'grep' | grep -v "$0" | awk '{print $1}';
     ps | grep 'socat .*pty,link=.*' | grep -v 'grep' | awk '{print $1}';
-    ps | grep 'gps_dbus' | grep -v 'grep' | awk '{print $1}';
+    ps | grep 'gps-dbus' | grep -v 'grep' | awk '{print $1}';
 )
 
 PIDS_TO_KILL_UNIQUE=$(echo "$PIDS_TO_KILL" | sort -u | tr '\n' ' ')

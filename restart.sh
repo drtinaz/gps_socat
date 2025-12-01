@@ -26,17 +26,23 @@ echo "---"
 ## 2. KILL ALL SERVICE-RELATED PROCESSES
 echo "Killing all components (App, Supervisor, Logger) to force system restart..."
 
-# Look for PIDs whose command line contains the service name
-# Exclude the script itself and grep process
-PIDS_TO_KILL=$(ps | grep "$SERVICE_NAME" | grep -v 'grep' | grep -v "$0" | awk '{print $1}')
+# Look for PIDs related to the main service, plus the explicit child processes.
+# This ensures we get all of: supervise, multilog, python (gps_socat.py), socat, and gps_dbus
+PIDS_TO_KILL=$(
+    ps | grep "$SERVICE_NAME" | grep -v 'grep' | grep -v "$0" | awk '{print $1}';
+    ps | grep 'socat .*pty,link=.*' | grep -v 'grep' | awk '{print $1}';
+    ps | grep 'gps_dbus' | grep -v 'grep' | awk '{print $1}';
+)
 
-if [ -z "$PIDS_TO_KILL" ]; then
+PIDS_TO_KILL_UNIQUE=$(echo "$PIDS_TO_KILL" | sort -u | tr '\n' ' ')
+
+if [ -z "$PIDS_TO_KILL_UNIQUE" ]; then
     echo "No running PIDs found."
 else
-    echo "Found PIDs: ($PIDS_TO_KILL). Sending **kill -9** to all..."
+    echo "Found PIDs: ($PIDS_TO_KILL_UNIQUE). Sending **kill -9** to all..."
     
     # KILL COMMAND (This is the action that triggers the system's immediate restart)
-    kill -9 $PIDS_TO_KILL 2>/dev/null
+    kill -9 $PIDS_TO_KILL_UNIQUE 2>/dev/null
     
     # Pause briefly for the OS to finalize the kill and for svscan to react.
     sleep 1

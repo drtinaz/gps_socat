@@ -36,8 +36,8 @@ def load_config():
             'max_idle_time_seconds': config.getint('MONITORING', 'max_idle_time_seconds'),
             'watchdog_check_interval': config.getint('MONITORING', 'watchdog_check_interval'),
             'dbus_service': config['MONITORING']['dbus_service'],
-            'dbus_object_path': config['MONITORING']['dbus_object_path'], # NEW KEY
-            'dbus_property_name': config['MONITORING']['dbus_property_name'], # NEW KEY
+            'dbus_object_path': config['MONITORING']['dbus_object_path'],
+            'dbus_property_name': config['MONITORING']['dbus_property_name'],
         }
         return cfg
     except KeyError as e:
@@ -64,9 +64,9 @@ def setup_logging():
 class GpsServiceManager:
     def __init__(self):
         self.config = load_config()
-        self.socat_process = None
+        self.socat_process_started = False # Flag to track socat success
         self.gps_dbus_process = None
-        self.last_good_data_time = time.time() # NEW: Track the last time satellites were seen
+        self.last_good_data_time = time.time() 
 
         logger.info("--- Initializing GPS Service Manager ---")
         
@@ -104,12 +104,16 @@ class GpsServiceManager:
         socat_cmd = [
             self.config['socat_path'],
             f"TCP:{self.config['router_ip']}:{self.config['router_port']}",
-            # --- FIX APPLIED: Added wait-for-eof=10 to improve connection stability ---
-            f"pty,link={self.config['tty_device']},raw,nonblock,echo=0,b{self.config['baud_rate']},wait-for-eof=10"
+            # Added 'fork' to prevent external supervisor from killing the service PID
+            f"pty,link={self.config['tty_device']},raw,nonblock,echo=0,b{self.config['baud_rate']},wait-for-eof=10",
+            'fork'
         ]
         logger.info(f"Starting socat: {' '.join(socat_cmd)}")
         try:
-            self.socat_process = subprocess.Popen(socat_cmd, stderr=subprocess.PIPE, stdout=subprocess.PIPE)
+            # Run socat. With 'fork', the parent process exits immediately, leaving the child running.
+            # We use subprocess.run to wait for the immediate exit of the parent.
+            subprocess.run(socat_cmd, check=True, timeout=5, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.socat_process_started = True 
         except Exception as e:
             logger.error(f"Failed to launch socat: {e}")
             return False
@@ -131,9 +135,8 @@ class GpsServiceManager:
             self._stop_services()
             return False
             
-        logger.info(f"Services started. socat PID: {self.socat_process.pid}, gps_dbus PID: {self.gps_dbus_process.pid}")
+        logger.info(f"Services started. gps_dbus PID: {self.gps_dbus_process.pid}")
         
-        # *** FIX: Reset the monitoring clock after a successful service start ***
         current_time = time.time()
         self.last_good_data_time = current_time 
         self.startup_time = current_time
@@ -142,22 +145,38 @@ class GpsServiceManager:
         return True
 
     def _stop_services(self):
-        """Stops the socat and gps_dbus processes."""
-        for proc in [self.gps_dbus_process, self.socat_process]:
-            if proc and proc.poll() is None:
-                logger.info(f"Stopping process (PID: {proc.pid})")
-                proc.terminate()
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                     proc.kill()
-                     logger.warning(f"Process (PID: {proc.pid}) did not stop gracefully, killed.")
-                     
-        self.socat_process = None
+        """
+        Stops the gps_dbus process and uses pkill to clean up any orphaned socat
+        processes associated with the TTY device, preventing PID leaks.
+        """
+        
+        # 1. Gracefully stop tracked process (gps_dbus)
+        if self.gps_dbus_process and self.gps_dbus_process.poll() is None:
+            logger.info(f"Stopping gps_dbus process (PID: {self.gps_dbus_process.pid})")
+            self.gps_dbus_process.terminate()
+            try:
+                self.gps_dbus_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                 self.gps_dbus_process.kill()
+                 logger.warning(f"gps_dbus Process (PID: {self.gps_dbus_process.pid}) did not stop gracefully, killed.")
+        
+        # 2. Brute-force cleanup of any orphaned socat or gps_dbus processes 
+        #    associated with the TTY device link, using pkill. (Fix for PID leaks)
+        tty_link = self.config['tty_device']
+        logger.info(f"Cleaning up any orphaned processes using {tty_link}...")
+        
+        # pkill looks for processes that have the TTY device path in their command line arguments.
+        pkill_cmd = ['pkill', '-f', tty_link]
+        try:
+            subprocess.run(pkill_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+            logger.info("Orphaned processes cleaned up using pkill.")
+        except Exception as e:
+            # pkill can fail if not found or permissions issue, but we continue anyway.
+            logger.warning(f"pkill cleanup failed (may not be installed or process already gone): {e}")
+
+        self.socat_process_started = False
         self.gps_dbus_process = None
         logger.info("All services stopped.")
-
-# ... other GpsServiceManager methods ...
 
     def _get_dbus_satellite_count(self):
         """
@@ -180,13 +199,10 @@ class GpsServiceManager:
             proc = subprocess.Popen(dbus_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             stdout, stderr = proc.communicate(timeout=5)
             
-            # --- FINAL FIX: LOOK FOR 'byte' INSTEAD OF 'int32' ---
             if 'byte' in stdout:
                 parts = stdout.split()
-                # Find the index of 'byte' and the value is the next part
                 value_str = parts[parts.index('byte') + 1]
                 return int(value_str)
-            # ---------------------------------------------------
                 
         except Exception as e:
             logger.debug(f"Could not read DBus property {self.config['dbus_property_name']}: {e}")
@@ -197,12 +213,15 @@ class GpsServiceManager:
     def _watchdog_monitor(self):
         """GLib Timeout handler: Checks process status and data presence."""
         
-        # 1. Check if processes are running (No change here)
-        if self.socat_process is None or self.socat_process.poll() is not None:
-            logger.error("socat process died unexpectedly! Initiating restart.")
-            self._stop_services()
-            self._start_services()
-            return True
+        # 1. Check if processes are running 
+        
+        # We rely on the 'socat_process_started' flag instead of a PID check,
+        # since the parent socat PID exits immediately with 'fork'.
+        if not self.socat_process_started:
+             logger.error("socat failed to start flag is set. Initiating full restart.")
+             self._stop_services()
+             self._start_services()
+             return True
         
         if self.gps_dbus_process is None or self.gps_dbus_process.poll() is not None:
             logger.error("gps_dbus process died unexpectedly! Initiating restart.")
@@ -210,7 +229,7 @@ class GpsServiceManager:
             self._start_services()
             return True
 
-        # 2. Check DBus for data activity (Fix/Satellite check)
+        # 2. Check DBus for data activity (Data integrity check is now the primary method to detect socat failure)
         satellite_count = self._get_dbus_satellite_count()
         max_idle = self.config['max_idle_time_seconds']
 
@@ -222,7 +241,7 @@ class GpsServiceManager:
             # Data is invalid (0 satellites or dbus read failed)
             time_since_last_fix = time.time() - self.last_good_data_time
             
-            logger.warning(f"No valid satellite count ({satellite_count}). Time since last good fix: {time_since_last_fix:.0f}s.") # Cleaned up variable name for clarity
+            logger.warning(f"No valid satellite count ({satellite_count}). Time since last good fix: {time_since_last_fix:.0f}s.") 
             
             if time_since_last_fix > max_idle:
                 logger.error(f"GPS data missing/invalid for over {max_idle}s. Initiating full service restart.")

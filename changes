@@ -22,3 +22,5 @@ v1.0.4
   add clarification for tty settings in config.ini
 v1.0.5.2beta
   update restart script and uninstall script to also handle child processes
+v1.0.5.3beta
+  add connection timout for socat

@@ -30,3 +30,5 @@ v1.0.5.5beta
   fix error in socat command
 v1.1.0beta
   revert broken socat logic
+v1.1.1beta
+  revert socat timeout

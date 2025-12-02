@@ -28,3 +28,5 @@ v1.0.5.4beta
   added fork to socat and seperated socat from the watchdog
 v1.0.5.5beta
   fix error in socat command
+v1.1.0beta
+  revert broken socat logic

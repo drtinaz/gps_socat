@@ -64,7 +64,7 @@ def setup_logging():
 class GpsServiceManager:
     def __init__(self):
         self.config = load_config()
-        self.socat_process_started = False # Flag to track socat success
+        self.socat_process_started = False 
         self.gps_dbus_process = None
         self.last_good_data_time = time.time() 
 
@@ -100,18 +100,23 @@ class GpsServiceManager:
         """Starts the socat and gps_dbus processes."""
         self._stop_services() # Clean state
 
+        # --- FIX APPLIED: Combine all PTY options including 'fork' into a single string ---
+        pty_options = (
+            f"pty,link={self.config['tty_device']},"
+            f"raw,nonblock,echo=0,b{self.config['baud_rate']},"
+            f"wait-for-eof=10,fork"
+        )
+        
         # 1. Start socat
         socat_cmd = [
             self.config['socat_path'],
             f"TCP:{self.config['router_ip']}:{self.config['router_port']}",
-            # Added 'fork' to prevent external supervisor from killing the service PID
-            f"pty,link={self.config['tty_device']},raw,nonblock,echo=0,b{self.config['baud_rate']},wait-for-eof=10",
-            'fork'
+            pty_options
         ]
+        
         logger.info(f"Starting socat: {' '.join(socat_cmd)}")
         try:
             # Run socat. With 'fork', the parent process exits immediately, leaving the child running.
-            # We use subprocess.run to wait for the immediate exit of the parent.
             subprocess.run(socat_cmd, check=True, timeout=5, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             self.socat_process_started = True 
         except Exception as e:
@@ -171,7 +176,6 @@ class GpsServiceManager:
             subprocess.run(pkill_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
             logger.info("Orphaned processes cleaned up using pkill.")
         except Exception as e:
-            # pkill can fail if not found or permissions issue, but we continue anyway.
             logger.warning(f"pkill cleanup failed (may not be installed or process already gone): {e}")
 
         self.socat_process_started = False
@@ -215,8 +219,7 @@ class GpsServiceManager:
         
         # 1. Check if processes are running 
         
-        # We rely on the 'socat_process_started' flag instead of a PID check,
-        # since the parent socat PID exits immediately with 'fork'.
+        # We rely on the 'socat_process_started' flag instead of a PID check.
         if not self.socat_process_started:
              logger.error("socat failed to start flag is set. Initiating full restart.")
              self._stop_services()
@@ -229,7 +232,7 @@ class GpsServiceManager:
             self._start_services()
             return True
 
-        # 2. Check DBus for data activity (Data integrity check is now the primary method to detect socat failure)
+        # 2. Check DBus for data activity
         satellite_count = self._get_dbus_satellite_count()
         max_idle = self.config['max_idle_time_seconds']
 

@@ -26,5 +26,5 @@ v1.0.5.3beta
   add connection timout for socat
 v1.0.5.4beta
   added fork to socat and seperated socat from the watchdog
-v1.1-1beta
+v1.0.5.5beta
   fix error in socat command

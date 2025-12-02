@@ -104,7 +104,8 @@ class GpsServiceManager:
         socat_cmd = [
             self.config['socat_path'],
             f"TCP:{self.config['router_ip']}:{self.config['router_port']}",
-            f"pty,link={self.config['tty_device']},raw,nonblock,echo=0,b{self.config['baud_rate']}"
+            # --- FIX APPLIED: Added wait-for-eof=10 to improve connection stability ---
+            f"pty,link={self.config['tty_device']},raw,nonblock,echo=0,b{self.config['baud_rate']},wait-for-eof=10"
         ]
         logger.info(f"Starting socat: {' '.join(socat_cmd)}")
         try:
@@ -254,3 +255,4 @@ if __name__ == "__main__":
         
     manager._stop_services()
     logger.info("Service process finished.")
+    

@@ -32,3 +32,5 @@ v1.1.0beta
   revert broken socat logic
 v1.1.1beta
   revert socat timeout
+v1.1
+  stable release

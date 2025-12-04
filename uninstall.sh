@@ -25,10 +25,16 @@ sleep 1
 echo "Removing driver from services..."
 rm /service/$SERVICE_NAME
 
-# kill
+# Kill all related processes
+echo "Killing all remaining related processes..."
 pkill -f "supervise .*$SERVICE_NAME"
 pkill -f "multilog .*$SERVICE_NAME"
+# Explicitly kill the main python app
 pkill -f "python .*$SERVICE_NAME"
+# Explicitly kill the child processes: socat and gps_dbus
+pkill -f "socat .*pty,link=.*"
+pkill -f "gps-dbus"
+
 
 echo "done."
 echo

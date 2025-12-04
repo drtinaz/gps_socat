@@ -20,3 +20,15 @@ v1.0.2
   update restart script
 v1.0.4
   add clarification for tty settings in config.ini
+v1.0.5.2beta
+  update restart script and uninstall script to also handle child processes
+v1.0.5.3beta
+  add connection timout for socat
+v1.0.5.4beta
+  added fork to socat and seperated socat from the watchdog
+v1.0.5.5beta
+  fix error in socat command
+v1.1.0beta
+  revert broken socat logic
+v1.1.1beta
+  revert socat timeout

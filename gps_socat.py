@@ -7,7 +7,7 @@ import signal
 import sys
 import logging
 import configparser
-import dbus
+import dbus # Import dbus here
 from dbus.mainloop.glib import DBusGMainLoop
 from gi.repository import GLib
 
@@ -16,6 +16,25 @@ CONFIG_FILE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'con
 
 # --- Global Logger Variable ---
 logger = None
+
+def setup_minimal_logging():
+    """Sets up a minimal logger that only prints to standard error/output."""
+    global logger
+    logger = logging.getLogger(__name__)
+    # Set level low enough to capture everything
+    logger.setLevel(logging.DEBUG) 
+
+    # Create console handler and set level to debug
+    ch = logging.StreamHandler(sys.stderr)
+    ch.setLevel(logging.DEBUG)
+
+    # Create a simple formatter
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    ch.setFormatter(formatter)
+
+    # Add the handler to the logger
+    if not logger.handlers:
+        logger.addHandler(ch)
 
 def load_config():
     """Loads all configuration settings from the config.ini file."""
@@ -37,38 +56,13 @@ def load_config():
             'max_idle_time_seconds': config.getint('MONITORING', 'max_idle_time_seconds'),
             'watchdog_check_interval': config.getint('MONITORING', 'watchdog_check_interval'),
             'dbus_service': config['MONITORING']['dbus_service'],
-            'log_file': config['LOGGING']['log_file'],
-            'log_level': config['LOGGING']['log_level'].upper()
+            # Removed LOGGING keys to resolve the KeyError
         }
         return cfg
     except KeyError as e:
+        # Using print here because logger is not yet fully configured
         print(f"ERROR: Missing configuration key in config.ini: {e}", file=sys.stderr)
         sys.exit(1)
-
-def setup_logging():
-    """Sets up the application logger."""
-    global logger
-    cfg = load_config()
-    
-    logger = logging.getLogger(__name__)
-    logger.setLevel(cfg['log_level'])
-
-    # Create file handler
-    fh = logging.FileHandler(cfg['log_file'])
-    fh.setLevel(cfg['log_level'])
-
-    # Create console handler
-    ch = logging.StreamHandler(sys.stdout)
-    ch.setLevel(logging.INFO)
-
-    # Create formatter and add it to the handlers
-    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-    fh.setFormatter(formatter)
-    ch.setFormatter(formatter)
-
-    # Add the handlers to the logger
-    logger.addHandler(fh)
-    logger.addHandler(ch)
 
 class GpsServiceManager:
     
@@ -100,6 +94,7 @@ class GpsServiceManager:
         
         try:
             # Start socat process, redirecting stdout/stderr to files or discarding
+            # Running without shell=True for better process management if possible
             self.socat_proc = subprocess.Popen(socat_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             logger.info(f"Started socat process (PID: {self.socat_proc.pid}) streaming to {self.config['tty_device']}.")
             time.sleep(1) # Give time for TTY device to be created
@@ -116,17 +111,17 @@ class GpsServiceManager:
         gps_dbus_cmd = [
             self.config['gps_dbus_path'],
             '-s', self.config['tty_device'],
-            '-b', self.config['baud_rate'],
+            '-b', str(self.config['baud_rate']),
             '-t', '0', 
-            '&' # Run in background
+            # '&' is removed here as it requires shell=True, which complicates process management.
+            # We assume gps-dbus is a non-daemonizing service suitable for Popen.
         ]
         
         try:
-            # We execute gps-dbus via shell to get the backgrounding (&) and path setup
-            # This relies on the system having the proper environment for Victron services
-            cmd_string = ' '.join(gps_dbus_cmd)
-            self.gps_dbus_proc = subprocess.Popen(cmd_string, shell=True, executable="/bin/bash", stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            logger.info(f"Started gps-dbus via shell (PID: {self.gps_dbus_proc.pid}).")
+            # Using Popen directly for better signal handling
+            # If gps-dbus requires the environment set by a shell script, this may need adjustment.
+            self.gps_dbus_proc = subprocess.Popen(gps_dbus_cmd, start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            logger.info(f"Started gps-dbus (PID: {self.gps_dbus_proc.pid}).")
 
         except FileNotFoundError:
             logger.error(f"gps-dbus executable not found at {self.config['gps_dbus_path']}.")
@@ -144,20 +139,26 @@ class GpsServiceManager:
         
         # 1. Terminate gps-dbus
         if self.gps_dbus_proc and self.gps_dbus_proc.poll() is None:
-            # Send SIGTERM to the process group (shell wrapper)
-            os.killpg(os.getpgid(self.gps_dbus_proc.pid), signal.SIGTERM)
-            self.gps_dbus_proc.wait(timeout=5)
+            # Use terminate and then kill if needed
+            self.gps_dbus_proc.terminate()
+            try:
+                self.gps_dbus_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.gps_dbus_proc.kill()
             logger.info("gps-dbus process terminated.")
             
         # 2. Terminate socat
         if self.socat_proc and self.socat_proc.poll() is None:
             self.socat_proc.terminate()
-            self.socat_proc.wait(timeout=5)
+            try:
+                self.socat_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.socat_proc.kill()
             logger.info("socat process terminated.")
 
         # Clean up the tty link if it still exists
-        if os.path.exists(self.config['tty_device']):
-            os.remove(self.config['tty_device'])
+        if os.path.islink(self.config['tty_device']):
+            os.unlink(self.config['tty_device'])
             logger.debug(f"Removed tty link {self.config['tty_device']}")
         
         # Give the system a brief moment to stabilize after stopping
@@ -232,7 +233,7 @@ def signal_handler(sig, frame):
 # --- Main Execution ---
 if __name__ == "__main__":
     
-    setup_logging()
+    setup_minimal_logging() # Use the minimal logging setup
     
     signal.signal(signal.SIGTERM, signal_handler)
     signal.signal(signal.SIGINT, signal_handler)

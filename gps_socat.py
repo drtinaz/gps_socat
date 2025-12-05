@@ -7,6 +7,7 @@ import signal
 import sys
 import logging
 import configparser
+import dbus
 from dbus.mainloop.glib import DBusGMainLoop
 from gi.repository import GLib
 
@@ -36,8 +37,8 @@ def load_config():
             'max_idle_time_seconds': config.getint('MONITORING', 'max_idle_time_seconds'),
             'watchdog_check_interval': config.getint('MONITORING', 'watchdog_check_interval'),
             'dbus_service': config['MONITORING']['dbus_service'],
-            'dbus_object_path': config['MONITORING']['dbus_object_path'], # NEW KEY
-            'dbus_property_name': config['MONITORING']['dbus_property_name'], # NEW KEY
+            'log_file': config['LOGGING']['log_file'],
+            'log_level': config['LOGGING']['log_level'].upper()
         }
         return cfg
     except KeyError as e:
@@ -45,186 +46,179 @@ def load_config():
         sys.exit(1)
 
 def setup_logging():
-    """Sets up standard output logging for multilog capture."""
+    """Sets up the application logger."""
     global logger
-    logger = logging.getLogger('GpsService')
-    logger.setLevel(logging.INFO)
+    cfg = load_config()
     
-    if logger.hasHandlers():
-        logger.handlers.clear()
-    
-    stream_handler = logging.StreamHandler(sys.stdout)
+    logger = logging.getLogger(__name__)
+    logger.setLevel(cfg['log_level'])
+
+    # Create file handler
+    fh = logging.FileHandler(cfg['log_file'])
+    fh.setLevel(cfg['log_level'])
+
+    # Create console handler
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setLevel(logging.INFO)
+
+    # Create formatter and add it to the handlers
     formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-    stream_handler.setFormatter(formatter)
-    logger.addHandler(stream_handler)
-    
-    logger.info("Service logging configured for multilog capture.")
-    return logger
+    fh.setFormatter(formatter)
+    ch.setFormatter(formatter)
+
+    # Add the handlers to the logger
+    logger.addHandler(fh)
+    logger.addHandler(ch)
 
 class GpsServiceManager:
+    
     def __init__(self):
         self.config = load_config()
-        self.socat_process = None
-        self.gps_dbus_process = None
-        self.last_good_data_time = time.time() # NEW: Track the last time satellites were seen
-
-        logger.info("--- Initializing GPS Service Manager ---")
+        self.last_good_data_time = time.time()
+        self.socat_proc = None
+        self.gps_dbus_proc = None
+        # NEW STATE VARIABLE: Tracks if the 'missing' message has been logged
+        self.dbus_missing_logged = False
         
-        if not self._install_socat():
-            sys.exit(1)
-
         self._start_services()
-
-        GLib.timeout_add_seconds(self.config['watchdog_check_interval'], self._watchdog_monitor)
         
-    def _install_socat(self):
-        """Checks for and installs socat using opkg if necessary."""
-        logger.info("Checking for socat installation...")
-        if not os.path.exists(self.config['socat_path']):
-            logger.warning("socat not found. Attempting installation via opkg...")
-            try:
-                subprocess.run(["opkg", "update"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                subprocess.run(["opkg", "install", "socat"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                logger.info("socat installed successfully.")
-            except subprocess.CalledProcessError as e:
-                logger.error(f"Failed to install socat: {e}")
-                return False
-            except FileNotFoundError:
-                 logger.error("opkg command not found. Cannot install socat.")
-                 return False
-        else:
-            logger.info("socat is already installed.")
-        return True
+        # Set up the GLib timer for the watchdog monitor
+        GLib.timeout_add_seconds(
+            self.config['watchdog_check_interval'], 
+            self._watchdog_monitor
+        )
 
     def _start_services(self):
-        """Starts the socat and gps_dbus processes."""
-        self._stop_services() # Clean state
-
+        """Starts socat and gps_dbus subprocesses."""
+        
         # 1. Start socat
         socat_cmd = [
             self.config['socat_path'],
             f"TCP:{self.config['router_ip']}:{self.config['router_port']}",
-            f"pty,link={self.config['tty_device']},raw,nonblock,echo=0,b{self.config['baud_rate']}"
+            f"PTY,link={self.config['tty_device']},raw,echo=0"
         ]
-        logger.info(f"Starting socat: {' '.join(socat_cmd)}")
+        
         try:
-            self.socat_process = subprocess.Popen(socat_cmd, stderr=subprocess.PIPE, stdout=subprocess.PIPE)
+            # Start socat process, redirecting stdout/stderr to files or discarding
+            self.socat_proc = subprocess.Popen(socat_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            logger.info(f"Started socat process (PID: {self.socat_proc.pid}) streaming to {self.config['tty_device']}.")
+            time.sleep(1) # Give time for TTY device to be created
+
+        except FileNotFoundError:
+            logger.error(f"Socat executable not found at {self.config['socat_path']}.")
+            sys.exit(1)
         except Exception as e:
-            logger.error(f"Failed to launch socat: {e}")
-            return False
-
-        time.sleep(2) # Give time for TTY link to be created
-
-        # 2. Start gps_dbus
+            logger.error(f"Failed to start socat: {e}")
+            sys.exit(1)
+            
+        # 2. Start gps-dbus
+        # NOTE: -t 0 tells gps-dbus to keep retrying if the tty is not available
         gps_dbus_cmd = [
             self.config['gps_dbus_path'],
-            "-s", self.config['tty_device'],
-            "-b", self.config['baud_rate'],
-            "-t", "0"
+            '-s', self.config['tty_device'],
+            '-b', self.config['baud_rate'],
+            '-t', '0', 
+            '&' # Run in background
         ]
-        logger.info(f"Starting gps_dbus: {' '.join(gps_dbus_cmd)}")
-        try:
-            self.gps_dbus_process = subprocess.Popen(gps_dbus_cmd, stderr=subprocess.PIPE, stdout=subprocess.PIPE)
-        except Exception as e:
-            logger.error(f"Failed to launch gps_dbus: {e}")
-            self._stop_services()
-            return False
-            
-        logger.info(f"Services started. socat PID: {self.socat_process.pid}, gps_dbus PID: {self.gps_dbus_process.pid}")
         
-        # *** FIX: Reset the monitoring clock after a successful service start ***
-        current_time = time.time()
-        self.last_good_data_time = current_time 
-        self.startup_time = current_time
-        logger.info("Watchdog timer reset due to successful service start.")
-
-        return True
-
-    def _stop_services(self):
-        """Stops the socat and gps_dbus processes."""
-        for proc in [self.gps_dbus_process, self.socat_process]:
-            if proc and proc.poll() is None:
-                logger.info(f"Stopping process (PID: {proc.pid})")
-                proc.terminate()
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                     proc.kill()
-                     logger.warning(f"Process (PID: {proc.pid}) did not stop gracefully, killed.")
-                     
-        self.socat_process = None
-        self.gps_dbus_process = None
-        logger.info("All services stopped.")
-
-# ... other GpsServiceManager methods ...
-
-    def _get_dbus_satellite_count(self):
-        """
-        Reads the /NrOfSatellites/Value property.
-        Returns the integer count, or None on failure/missing data.
-        """
         try:
-            dbus_cmd = [
-                'dbus-send', 
-                '--system', 
-                '--print-reply', 
-                '--type=method_call', 
-                f"--dest={self.config['dbus_service']}", 
-                self.config['dbus_object_path'],
-                'org.freedesktop.DBus.Properties.Get', 
-                'string:com.victronenergy.BusItem', 
-                f"string:{self.config['dbus_property_name']}"
-            ]
+            # We execute gps-dbus via shell to get the backgrounding (&) and path setup
+            # This relies on the system having the proper environment for Victron services
+            cmd_string = ' '.join(gps_dbus_cmd)
+            self.gps_dbus_proc = subprocess.Popen(cmd_string, shell=True, executable="/bin/bash", stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            logger.info(f"Started gps-dbus via shell (PID: {self.gps_dbus_proc.pid}).")
+
+        except FileNotFoundError:
+            logger.error(f"gps-dbus executable not found at {self.config['gps_dbus_path']}.")
+            sys.exit(1)
+        except Exception as e:
+            logger.error(f"Failed to start gps-dbus: {e}")
+            # If gps-dbus fails to start, kill socat too for a clean exit
+            self._stop_services() 
+            sys.exit(1)
+        
+    def _stop_services(self):
+        """Terminates socat and gps_dbus processes."""
+        
+        logger.info("Stopping services.")
+        
+        # 1. Terminate gps-dbus
+        if self.gps_dbus_proc and self.gps_dbus_proc.poll() is None:
+            # Send SIGTERM to the process group (shell wrapper)
+            os.killpg(os.getpgid(self.gps_dbus_proc.pid), signal.SIGTERM)
+            self.gps_dbus_proc.wait(timeout=5)
+            logger.info("gps-dbus process terminated.")
             
-            proc = subprocess.Popen(dbus_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            stdout, stderr = proc.communicate(timeout=5)
-            
-            # --- FINAL FIX: LOOK FOR 'byte' INSTEAD OF 'int32' ---
-            if 'byte' in stdout:
-                parts = stdout.split()
-                # Find the index of 'byte' and the value is the next part
-                value_str = parts[parts.index('byte') + 1]
-                return int(value_str)
-            # ---------------------------------------------------
+        # 2. Terminate socat
+        if self.socat_proc and self.socat_proc.poll() is None:
+            self.socat_proc.terminate()
+            self.socat_proc.wait(timeout=5)
+            logger.info("socat process terminated.")
+
+        # Clean up the tty link if it still exists
+        if os.path.exists(self.config['tty_device']):
+            os.remove(self.config['tty_device'])
+            logger.debug(f"Removed tty link {self.config['tty_device']}")
+        
+        # Give the system a brief moment to stabilize after stopping
+        time.sleep(1) 
+
+    def _check_dbus_service_status(self):
+        """Checks if the gps-dbus service name is currently registered on the D-Bus."""
+        try:
+            # Get a connection to the system bus
+            bus = dbus.SystemBus() 
+            # Check if the configured service name is in the list of active names
+            is_running = self.config['dbus_service'] in bus.list_names()
+            return is_running
                 
         except Exception as e:
-            logger.debug(f"Could not read DBus property {self.config['dbus_property_name']}: {e}")
-            return None
-            
-        return None
+            # Failsafe: Log error if D-Bus communication itself fails
+            logger.error(f"Failed to communicate with D-Bus while checking status: {e}")
+            return False
 
     def _watchdog_monitor(self):
-        """GLib Timeout handler: Checks process status and data presence."""
+        """
+        Monitors the gps-dbus service existence on D-Bus. 
+        Restarts services if missing for longer than max_idle_time_seconds.
+        """
         
-        # 1. Check if processes are running (No change here)
-        if self.socat_process is None or self.socat_process.poll() is not None:
-            logger.error("socat process died unexpectedly! Initiating restart.")
-            self._stop_services()
-            self._start_services()
-            return True
-        
-        if self.gps_dbus_process is None or self.gps_dbus_process.poll() is not None:
-            logger.error("gps_dbus process died unexpectedly! Initiating restart.")
-            self._stop_services()
-            self._start_services()
-            return True
-
-        # 2. Check DBus for data activity (Fix/Satellite check)
-        satellite_count = self._get_dbus_satellite_count()
+        service_is_active = self._check_dbus_service_status() 
         max_idle = self.config['max_idle_time_seconds']
-
-        if satellite_count is not None and satellite_count > 0:
-            # We have good data (non-zero satellites); reset the timer
+        
+        if service_is_active:
+            # --- A) Service is Active ---
+            
+            # Check if we were previously in a missing state (flag is True)
+            if self.dbus_missing_logged:
+                # Log restoration message, clear flag, and reset timer
+                logger.info("GPS DBus service restored. Timer reset.")
+                self.dbus_missing_logged = False
+                
+            # Reset the timer (for normal operation or after restoration)
             self.last_good_data_time = time.time()
-            logger.debug(f"GPS Fix Active. Satellites: {satellite_count}. Monitoring continues.")
+            logger.debug("GPS DBus service is active. Monitoring continues.")
+            
         else:
-            # Data is invalid (0 satellites or dbus read failed)
+            # --- B) Service is Missing ---
             time_since_last_fix = time.time() - self.last_good_data_time
             
-            logger.warning(f"No valid satellite count ({satellite_count}). Time since last good fix: {time_since_last_fix:.0f}s.") # Cleaned up variable name for clarity
-            
+            # Log the missing message ONLY ONCE
+            if not self.dbus_missing_logged:
+                logger.warning(
+                    f"GPS DBus service is MISSING. Starting idle timer. Time since last active: {time_since_last_fix:.0f}s."
+                ) 
+                self.dbus_missing_logged = True # Set the flag so it doesn't log again
+                
+            else:
+                logger.debug(
+                    f"GPS DBus service is still missing. Time since last active: {time_since_last_fix:.0f}s."
+                )
+
+            # Check for timeout and initiate restart
             if time_since_last_fix > max_idle:
-                logger.error(f"GPS data missing/invalid for over {max_idle}s. Initiating full service restart.")
+                logger.error(f"GPS service missing for over {max_idle}s. Initiating full service restart.")
+                # The flag remains True; it will be reset only after successful service restoration
                 self._stop_services()
                 self._start_services()
             
@@ -250,7 +244,8 @@ if __name__ == "__main__":
     try:
         mainloop.run()
     except Exception as e:
-        logger.error(f"Main loop encountered an error: {e}. Exiting.")
+        logger.error(f"Main loop encountered an unhandled exception: {e}")
+    finally:
+        manager._stop_services()
+        logger.info("Application shut down.")
         
-    manager._stop_services()
-    logger.info("Service process finished.")

@@ -38,3 +38,5 @@ v1.1.2beta
   simplify watchdog polling method
 v1.1.3beta
   bump
+v1.1.4beta
+  reduce log spamming

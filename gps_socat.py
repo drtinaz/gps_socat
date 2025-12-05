@@ -189,10 +189,9 @@ class GpsServiceManager:
                     logger.critical(f"Watchdog: Service failure persisted for over {max_idle}s. Initiating full service RESTART.")
                     self._stop_services()
                     self._start_services()
-                else:
-                    # Waiting for grace period to expire
-                    logger.warning(f"Watchdog: Service still down. Restart in {max_idle - time_in_error_state:.0f}s.")
-
+                
+                # REPEATED WARNING REMOVED: No logging here until the critical failure is hit.
+                
         else:
             # --- Services are running (Healthy State) ---
             if self.error_state_start_time is not None:

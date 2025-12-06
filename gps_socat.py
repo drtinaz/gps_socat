@@ -33,11 +33,10 @@ def load_config():
             'baud_rate': config['CONNECTION']['baud_rate'],
             'gps_dbus_path': config['PATHS']['gps_dbus_path'],
             'socat_path': config['PATHS']['socat_path'],
+            # Keeping max_idle_time_seconds for the grace period
             'max_idle_time_seconds': config.getint('MONITORING', 'max_idle_time_seconds'),
             'watchdog_check_interval': config.getint('MONITORING', 'watchdog_check_interval'),
-            'dbus_service': config['MONITORING']['dbus_service'],
-            'dbus_object_path': config['MONITORING']['dbus_object_path'], # NEW KEY
-            'dbus_property_name': config['MONITORING']['dbus_property_name'], # NEW KEY
+            # Removed unused DBus keys: dbus_service, dbus_object_path, dbus_property_name
         }
         return cfg
     except KeyError as e:
@@ -66,7 +65,8 @@ class GpsServiceManager:
         self.config = load_config()
         self.socat_process = None
         self.gps_dbus_process = None
-        self.last_good_data_time = time.time() # NEW: Track the last time satellites were seen
+        # MODIFIED: Tracks when an issue (process fail) was first detected. None when healthy.
+        self.error_state_start_time = None 
 
         logger.info("--- Initializing GPS Service Manager ---")
         
@@ -132,11 +132,9 @@ class GpsServiceManager:
             
         logger.info(f"Services started. socat PID: {self.socat_process.pid}, gps_dbus PID: {self.gps_dbus_process.pid}")
         
-        # *** FIX: Reset the monitoring clock after a successful service start ***
-        current_time = time.time()
-        self.last_good_data_time = current_time 
-        self.startup_time = current_time
-        logger.info("Watchdog timer reset due to successful service start.")
+        # Reset the error timer after a successful service start
+        self.error_state_start_time = None 
+        logger.info("Watchdog error timer reset due to successful service start.")
 
         return True
 
@@ -156,77 +154,57 @@ class GpsServiceManager:
         self.gps_dbus_process = None
         logger.info("All services stopped.")
 
-# ... other GpsServiceManager methods ...
-
-    def _get_dbus_satellite_count(self):
-        """
-        Reads the /NrOfSatellites/Value property.
-        Returns the integer count, or None on failure/missing data.
-        """
-        try:
-            dbus_cmd = [
-                'dbus-send', 
-                '--system', 
-                '--print-reply', 
-                '--type=method_call', 
-                f"--dest={self.config['dbus_service']}", 
-                self.config['dbus_object_path'],
-                'org.freedesktop.DBus.Properties.Get', 
-                'string:com.victronenergy.BusItem', 
-                f"string:{self.config['dbus_property_name']}"
-            ]
-            
-            proc = subprocess.Popen(dbus_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            stdout, stderr = proc.communicate(timeout=5)
-            
-            # --- FINAL FIX: LOOK FOR 'byte' INSTEAD OF 'int32' ---
-            if 'byte' in stdout:
-                parts = stdout.split()
-                # Find the index of 'byte' and the value is the next part
-                value_str = parts[parts.index('byte') + 1]
-                return int(value_str)
-            # ---------------------------------------------------
-                
-        except Exception as e:
-            logger.debug(f"Could not read DBus property {self.config['dbus_property_name']}: {e}")
-            return None
-            
-        return None
-
+    # Removed the _get_dbus_satellite_count method
+    
     def _watchdog_monitor(self):
-        """GLib Timeout handler: Checks process status and data presence."""
+        """GLib Timeout handler: Checks process status and uses max_idle_time_seconds as a grace period before restart."""
         
-        # 1. Check if processes are running (No change here)
-        if self.socat_process is None or self.socat_process.poll() is not None:
-            logger.error("socat process died unexpectedly! Initiating restart.")
-            self._stop_services()
-            self._start_services()
-            return True
+        # Check if processes are running (.poll() returns None if running)
+        is_socat_dead = self.socat_process is None or self.socat_process.poll() is not None
+        is_gps_dbus_dead = self.gps_dbus_process is None or self.gps_dbus_process.poll() is not None
         
-        if self.gps_dbus_process is None or self.gps_dbus_process.poll() is not None:
-            logger.error("gps_dbus process died unexpectedly! Initiating restart.")
-            self._stop_services()
-            self._start_services()
-            return True
-
-        # 2. Check DBus for data activity (Fix/Satellite check)
-        satellite_count = self._get_dbus_satellite_count()
         max_idle = self.config['max_idle_time_seconds']
+        current_time = time.time()
 
-        if satellite_count is not None and satellite_count > 0:
-            # We have good data (non-zero satellites); reset the timer
-            self.last_good_data_time = time.time()
-            logger.debug(f"GPS Fix Active. Satellites: {satellite_count}. Monitoring continues.")
+        if is_socat_dead or is_gps_dbus_dead:
+            # --- Services are dead/missing (Error State) ---
+            
+            if self.error_state_start_time is None:
+                # FIRST FAILURE DETECTED: Start the timer and log the initial error
+                self.error_state_start_time = current_time
+                
+                # Log only once:
+                dead_proc = "socat" if is_socat_dead else "gps_dbus"
+                if is_socat_dead and is_gps_dbus_dead:
+                    dead_proc = "socat AND gps_dbus"
+                    
+                logger.error(f"Watchdog: {dead_proc} process found dead! Starting {max_idle}s restart grace timer.")
+                
+            else:
+                # FAILURE PERSISTS: Check if the grace period has expired
+                time_in_error_state = current_time - self.error_state_start_time
+                
+                if time_in_error_state > max_idle:
+                    # GRACE PERIOD EXPIRED: Initiate restart
+                    logger.critical(f"Watchdog: Service failure persisted for over {max_idle}s. Initiating full service RESTART.")
+                    self._stop_services()
+                    self._start_services()
+                
+                # REPEATED WARNING REMOVED: No logging here until the critical failure is hit.
+                
         else:
-            # Data is invalid (0 satellites or dbus read failed)
-            time_since_last_fix = time.time() - self.last_good_data_time
+            # --- Services are running (Healthy State) ---
+            if self.error_state_start_time is not None:
+                # We recovered naturally because error_state_start_time was set but processes are now running.
+                time_in_error_state = current_time - self.error_state_start_time
+                
+                # Log the self-restoration event
+                logger.info(f"Watchdog: Service self-restored after {time_in_error_state:.1f}s of downtime/grace period.")
+                
+                # Clear the error state timer
+                self.error_state_start_time = None
             
-            logger.warning(f"No valid satellite count ({satellite_count}). Time since last good fix: {time_since_last_fix:.0f}s.") # Cleaned up variable name for clarity
-            
-            if time_since_last_fix > max_idle:
-                logger.error(f"GPS data missing/invalid for over {max_idle}s. Initiating full service restart.")
-                self._stop_services()
-                self._start_services()
+            logger.debug("Watchdog: Services are running. Monitoring continues.")
             
         return True 
 
@@ -254,3 +232,4 @@ if __name__ == "__main__":
         
     manager._stop_services()
     logger.info("Service process finished.")
+    

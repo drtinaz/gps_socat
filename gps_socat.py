@@ -20,6 +20,8 @@ UTC_CHECK_INTERVAL = 30
 NO_UTC_TIMEOUT = 120
 STARTUP_WAIT_SECONDS = 5
 STARTUP_MAX_WAIT = 30
+TTY_MAX_WAIT = 10
+GPS_DBUS_MAX_RETRIES = 3
 
 # --- DBus paths for gps_dbus service ---
 GPS_DBUS_SERVICE_PREFIX = "com.victronenergy.gps"
@@ -138,6 +140,7 @@ class GpsServiceManager:
     
     def _handle_sigchld(self, signum, frame):
         """Called immediately when any child process dies."""
+        logger.debug(f"SIGCHLD received")
         GLib.idle_add(self._check_crashed_processes)
         
     def _check_crashed_processes(self):
@@ -219,18 +222,47 @@ class GpsServiceManager:
             self.watchdog_id = None
             logger.debug("Watchdog stopped")
     
+    def _check_tty_stability(self):
+        """Check if TTY device exists and gps_dbus is still running."""
+        # Check TTY device
+        if not os.path.exists(self.config['tty_device']):
+            logger.error(f"!!! TTY DEVICE MISSING: {self.config['tty_device']} !!!")
+            self._immediate_restart()
+            return False
+        
+        # Check if gps_dbus process is still running (fallback for missed SIGCHLD)
+        if self.gps_dbus_process:
+            poll_result = self.gps_dbus_process.poll()
+            if poll_result is not None:
+                logger.error(f"!!! GPS_DBUS PROCESS DIED (exit code: {poll_result}) !!!")
+                self._immediate_restart()
+                return False
+        
+        # Check if socat process is still running (fallback for missed SIGCHLD)
+        if self.socat_process:
+            poll_result = self.socat_process.poll()
+            if poll_result is not None:
+                logger.error(f"!!! SOCAT PROCESS DIED (exit code: {poll_result}) !!!")
+                self._immediate_restart()
+                return False
+        
+        return True
+    
     def _watchdog_check(self):
         """Periodic check for UTC staleness and service availability."""
+        # Don't check if waiting for restart
         if self.waiting_for_restart:
             return True
         
-        if not self._are_services_running():
-            logger.debug("Services not running, skipping check")
+        # Check TTY and processes first (fallback for missed SIGCHLD)
+        if not self._check_tty_stability():
             return True
         
+        # Check if GPS DBus service is available
         if not self.bus.name_has_owner(self.dbus_service_name):
             logger.error(f"!!! GPS DBUS SERVICE UNAVAILABLE !!!")
             logger.error(f"  Service {self.dbus_service_name} is not registered on DBus")
+            logger.error(f"  This indicates gps_dbus crashed or failed to start")
             self._immediate_restart()
             return True
         
@@ -365,18 +397,18 @@ class GpsServiceManager:
             return False
 
     def _start_services(self):
-        """Start socat and gps_dbus processes."""
+        """Start socat and gps_dbus processes with retry logic."""
         logger.info("-" * 60)
         logger.info("STARTING SERVICES")
         logger.info("-" * 60)
         
         self._stop_services()
 
-        # Start socat
+        # Start socat with improved options
         socat_cmd = [
             self.config['socat_path'],
             f"TCP:{self.config['router_ip']}:{self.config['router_port']}",
-            f"pty,link={self.config['tty_device']},raw,nonblock,echo=0,b{self.config['baud_rate']}"
+            f"pty,link={self.config['tty_device']},raw,nonblock,echo=0,wait-slave,perm=666,b{self.config['baud_rate']}"
         ]
         logger.info(f"Starting socat...")
         try:
@@ -386,29 +418,51 @@ class GpsServiceManager:
             logger.error(f"  ✗ Failed to start socat: {e}")
             return False
 
-        logger.info(f"Waiting 2 seconds for TTY device to be created...")
-        time.sleep(2)
-        
-        if os.path.exists(self.config['tty_device']):
-            logger.info(f"  ✓ TTY device {self.config['tty_device']} created")
+        # Wait for TTY device to be created and stabilized
+        logger.info(f"Waiting for TTY device to be created...")
+        for i in range(TTY_MAX_WAIT):
+            if os.path.exists(self.config['tty_device']):
+                logger.info(f"  ✓ TTY device {self.config['tty_device']} created after {i+1}s")
+                break
+            time.sleep(1)
         else:
-            logger.warning(f"  ⚠ TTY device {self.config['tty_device']} not found")
+            logger.warning(f"  ⚠ TTY device {self.config['tty_device']} not found after {TTY_MAX_WAIT}s")
 
-        # Start gps_dbus
+        # Additional delay to ensure device is stable
+        time.sleep(2)
+
+        # Start gps_dbus with retry logic
         gps_dbus_cmd = [
             self.config['gps_dbus_path'],
             "-s", self.config['tty_device'],
             "-b", str(self.config['baud_rate']),
             "-t", "0"
         ]
-        logger.info(f"Starting gps_dbus...")
-        try:
-            self.gps_dbus_process = subprocess.Popen(gps_dbus_cmd, stderr=subprocess.PIPE, stdout=subprocess.PIPE)
-            logger.info(f"  ✓ gps_dbus started (PID: {self.gps_dbus_process.pid})")
-        except Exception as e:
-            logger.error(f"  ✗ Failed to start gps_dbus: {e}")
-            self._stop_services()
-            return False
+        
+        # Try to start gps_dbus with retries
+        for attempt in range(GPS_DBUS_MAX_RETRIES):
+            logger.info(f"Starting gps_dbus (attempt {attempt+1}/{GPS_DBUS_MAX_RETRIES})...")
+            try:
+                self.gps_dbus_process = subprocess.Popen(gps_dbus_cmd, stderr=subprocess.PIPE, stdout=subprocess.PIPE)
+                logger.info(f"  ✓ gps_dbus started (PID: {self.gps_dbus_process.pid})")
+                
+                # Wait a bit and check if it stays alive
+                time.sleep(3)
+                if self.gps_dbus_process.poll() is not None:
+                    # Read stderr to see why it died
+                    stderr = self.gps_dbus_process.stderr.read()
+                    logger.warning(f"  ⚠ gps_dbus died immediately (attempt {attempt+1})")
+                    if stderr:
+                        logger.warning(f"    Error: {stderr.decode()[:200]}")
+                    continue
+                else:
+                    logger.info(f"  ✓ gps_dbus is stable")
+                    break
+            except Exception as e:
+                logger.error(f"  ✗ Failed to start gps_dbus: {e}")
+                if attempt == GPS_DBUS_MAX_RETRIES - 1:
+                    self._stop_services()
+                    return False
             
         logger.info("-" * 60)
         logger.info(f"SERVICES STARTED")
